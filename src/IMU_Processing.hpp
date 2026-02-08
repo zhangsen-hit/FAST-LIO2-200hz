@@ -62,6 +62,11 @@ class ImuProcess
   double first_lidar_time;
   int lidar_type;
 
+  /** @brief Get start time of the last processed frame (for high-freq odom timestamps). */
+  double get_pcl_beg_time() const { return last_pcl_beg_time_; }
+  /** @brief Get IMU poses at each IMU time in the last processed frame (for high-freq odom). */
+  const vector<Pose6D> & get_IMUpose() const { return IMUpose; }
+
  private:
   void IMU_init(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, int &N);
   void UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, PointCloudXYZI &pcl_in_out);
@@ -79,13 +84,14 @@ class ImuProcess
   V3D acc_s_last;
   double start_timestamp_;
   double last_lidar_end_time_;
+  double last_pcl_beg_time_;
   int    init_iter_num = 1;
   bool   b_first_frame_ = true;
   bool   imu_need_init_ = true;
 };
 
 ImuProcess::ImuProcess()
-    : b_first_frame_(true), imu_need_init_(true), start_timestamp_(-1)
+    : b_first_frame_(true), imu_need_init_(true), start_timestamp_(-1), last_pcl_beg_time_(0.0)
 {
   init_iter_num = 1;
   Q = process_noise_cov();
@@ -299,10 +305,11 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
   double note = pcl_end_time > imu_end_time ? 1.0 : -1.0;
   dt = note * (pcl_end_time - imu_end_time);
   kf_state.predict(dt, Q, in);
-  
+
   imu_state = kf_state.get_x();
   last_imu_ = meas.imu.back();
   last_lidar_end_time_ = pcl_end_time;
+  last_pcl_beg_time_   = pcl_beg_time;
 
   /*** undistort each lidar point (backward propagation) ***/
   if (pcl_out.points.begin() == pcl_out.points.end()) return;

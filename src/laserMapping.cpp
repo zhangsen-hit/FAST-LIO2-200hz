@@ -93,7 +93,7 @@ int    effct_feat_num = 0, time_log_counter = 0, scan_count = 0, publish_count =
 int    iterCount = 0, feats_down_size = 0, NUM_MAX_ITERATIONS = 0, laserCloudValidNum = 0, pcd_save_interval = -1, pcd_index = 0;
 bool   point_selected_surf[100000] = {0};
 bool   lidar_pushed, flg_first_scan = true, flg_exit = false, flg_EKF_inited;
-bool   scan_pub_en = false, dense_pub_en = false, scan_body_pub_en = false;
+bool   scan_pub_en = false, dense_pub_en = false, scan_body_pub_en = false, high_freq_odom_en = true;
 int lidar_type;
 
 vector<vector<int>>  pointSearchInd_surf; 
@@ -619,6 +619,48 @@ void publish_odometry(const ros::Publisher & pubOdomAftMapped)
     br.sendTransform( tf::StampedTransform( transform, odomAftMapped.header.stamp, "camera_init", "body" ) );
 }
 
+inline void set_odom_pose_from_pose6d(nav_msgs::Odometry &odom, const Pose6D &pose)
+{
+    odom.pose.pose.position.x = pose.pos[0];
+    odom.pose.pose.position.y = pose.pos[1];
+    odom.pose.pose.position.z = pose.pos[2];
+    M3D R;
+    R << MAT_FROM_ARRAY(pose.rot);
+    Eigen::Quaterniond q(R);
+    odom.pose.pose.orientation.x = q.x();
+    odom.pose.pose.orientation.y = q.y();
+    odom.pose.pose.orientation.z = q.z();
+    odom.pose.pose.orientation.w = q.w();
+}
+
+void publish_odometry_high_freq(const ros::Publisher & pubOdomHighFreq)
+{
+    const double pcl_beg = p_imu->get_pcl_beg_time();
+    const vector<Pose6D> & imu_poses = p_imu->get_IMUpose();
+    nav_msgs::Odometry odom_high;
+    odom_high.header.frame_id = "camera_init";
+    odom_high.child_frame_id  = "body";
+
+    for (size_t i = 0; i < imu_poses.size(); i++)
+    {
+        const Pose6D & pose = imu_poses[i];
+        double t = pcl_beg + pose.offset_time;
+        odom_high.header.stamp = ros::Time().fromSec(t);
+        set_odom_pose_from_pose6d(odom_high, pose);
+        odom_high.twist.twist.linear.x = pose.vel[0];
+        odom_high.twist.twist.linear.y = pose.vel[1];
+        odom_high.twist.twist.linear.z = pose.vel[2];
+        pubOdomHighFreq.publish(odom_high);
+    }
+
+    odom_high.header.stamp = ros::Time().fromSec(lidar_end_time);
+    set_posestamp(odom_high.pose);
+    odom_high.twist.twist.linear.x = state_point.vel(0);
+    odom_high.twist.twist.linear.y = state_point.vel(1);
+    odom_high.twist.twist.linear.z = state_point.vel(2);
+    pubOdomHighFreq.publish(odom_high);
+}
+
 void publish_path(const ros::Publisher pubPath)
 {
     set_posestamp(msg_body_pose);
@@ -762,6 +804,7 @@ int main(int argc, char** argv)
     nh.param<bool>("publish/scan_publish_en",scan_pub_en, true);
     nh.param<bool>("publish/dense_publish_en",dense_pub_en, true);
     nh.param<bool>("publish/scan_bodyframe_pub_en",scan_body_pub_en, true);
+    nh.param<bool>("publish/high_freq_odom_en", high_freq_odom_en, true);
     nh.param<int>("max_iteration",NUM_MAX_ITERATIONS,4);
     nh.param<string>("map_file_path",map_file_path,"");
     nh.param<string>("common/lid_topic",lid_topic,"/livox/lidar");
@@ -856,6 +899,8 @@ int main(int argc, char** argv)
             ("/Laser_map", 100000);
     ros::Publisher pubOdomAftMapped = nh.advertise<nav_msgs::Odometry> 
             ("/Odometry", 100000);
+    ros::Publisher pubOdomHighFreq  = nh.advertise<nav_msgs::Odometry> 
+            ("/Odometry_high_freq", 100000);
     ros::Publisher pubPath          = nh.advertise<nav_msgs::Path> 
             ("/path", 100000);
 //------------------------------------------------------------------------------------------------------
@@ -970,6 +1015,8 @@ int main(int argc, char** argv)
 
             /******* Publish odometry *******/
             publish_odometry(pubOdomAftMapped);
+            if (high_freq_odom_en)
+                publish_odometry_high_freq(pubOdomHighFreq);
 
             /*** add the feature points to map kdtree ***/
             t3 = omp_get_wtime();
