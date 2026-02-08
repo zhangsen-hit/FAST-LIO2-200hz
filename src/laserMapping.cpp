@@ -93,7 +93,7 @@ int    effct_feat_num = 0, time_log_counter = 0, scan_count = 0, publish_count =
 int    iterCount = 0, feats_down_size = 0, NUM_MAX_ITERATIONS = 0, laserCloudValidNum = 0, pcd_save_interval = -1, pcd_index = 0;
 bool   point_selected_surf[100000] = {0};
 bool   lidar_pushed, flg_first_scan = true, flg_exit = false, flg_EKF_inited;
-bool   scan_pub_en = false, dense_pub_en = false, scan_body_pub_en = false, high_freq_odom_en = true;
+bool   scan_pub_en = false, dense_pub_en = false, scan_body_pub_en = false, high_freq_odom_en = true, high_freq_odom_backward_correct_en = true;
 int lidar_type;
 
 vector<vector<int>>  pointSearchInd_surf; 
@@ -131,6 +131,12 @@ MeasureGroup Measures;
 esekfom::esekf<state_ikfom, 12, input_ikfom> kf;
 state_ikfom state_point;
 vect3 pos_lid;
+
+/*** predicted state at frame-end (before lidar update), for high-freq odom backward correction ***/
+V3D state_predicted_end_pos;
+V3D state_predicted_end_vel;
+M3D state_predicted_end_rot;
+bool state_predicted_end_valid = false;
 
 nav_msgs::Path path;
 nav_msgs::Odometry odomAftMapped;
@@ -633,6 +639,18 @@ inline void set_odom_pose_from_pose6d(nav_msgs::Odometry &odom, const Pose6D &po
     odom.pose.pose.orientation.w = q.w();
 }
 
+inline void set_odom_pose_from_state(nav_msgs::Odometry &odom, const V3D &pos, const M3D &rot)
+{
+    odom.pose.pose.position.x = pos(0);
+    odom.pose.pose.position.y = pos(1);
+    odom.pose.pose.position.z = pos(2);
+    Eigen::Quaterniond q(rot);
+    odom.pose.pose.orientation.x = q.x();
+    odom.pose.pose.orientation.y = q.y();
+    odom.pose.pose.orientation.z = q.z();
+    odom.pose.pose.orientation.w = q.w();
+}
+
 void publish_odometry_high_freq(const ros::Publisher & pubOdomHighFreq)
 {
     const double pcl_beg = p_imu->get_pcl_beg_time();
@@ -641,15 +659,48 @@ void publish_odometry_high_freq(const ros::Publisher & pubOdomHighFreq)
     odom_high.header.frame_id = "camera_init";
     odom_high.child_frame_id  = "body";
 
+    const double period = lidar_end_time - pcl_beg;
+    const bool use_backward_correct = high_freq_odom_backward_correct_en && state_predicted_end_valid && period > 1e-9;
+
+    V3D delta_pos, delta_vel;
+    V3D omega;
+    M3D R_err;
+    if (use_backward_correct)
+    {
+        delta_pos = state_point.pos - state_predicted_end_pos;
+        delta_vel = state_point.vel - state_predicted_end_vel;
+        R_err = state_point.rot.toRotationMatrix() * state_predicted_end_rot.inverse();
+        omega = Log(R_err);
+    }
+
     for (size_t i = 0; i < imu_poses.size(); i++)
     {
         const Pose6D & pose = imu_poses[i];
         double t = pcl_beg + pose.offset_time;
         odom_high.header.stamp = ros::Time().fromSec(t);
-        set_odom_pose_from_pose6d(odom_high, pose);
-        odom_high.twist.twist.linear.x = pose.vel[0];
-        odom_high.twist.twist.linear.y = pose.vel[1];
-        odom_high.twist.twist.linear.z = pose.vel[2];
+
+        if (use_backward_correct)
+        {
+            const double alpha = period > 1e-9 ? (pose.offset_time / period) : 0.0;
+            V3D pos_corrected(pose.pos[0], pose.pos[1], pose.pos[2]);
+            V3D vel_corrected(pose.vel[0], pose.vel[1], pose.vel[2]);
+            pos_corrected += alpha * delta_pos;
+            vel_corrected += alpha * delta_vel;
+            M3D R_i;
+            R_i << MAT_FROM_ARRAY(pose.rot);
+            M3D R_corrected = Exp(omega, alpha) * R_i;
+            set_odom_pose_from_state(odom_high, pos_corrected, R_corrected);
+            odom_high.twist.twist.linear.x = vel_corrected(0);
+            odom_high.twist.twist.linear.y = vel_corrected(1);
+            odom_high.twist.twist.linear.z = vel_corrected(2);
+        }
+        else
+        {
+            set_odom_pose_from_pose6d(odom_high, pose);
+            odom_high.twist.twist.linear.x = pose.vel[0];
+            odom_high.twist.twist.linear.y = pose.vel[1];
+            odom_high.twist.twist.linear.z = pose.vel[2];
+        }
         pubOdomHighFreq.publish(odom_high);
     }
 
@@ -805,6 +856,7 @@ int main(int argc, char** argv)
     nh.param<bool>("publish/dense_publish_en",dense_pub_en, true);
     nh.param<bool>("publish/scan_bodyframe_pub_en",scan_body_pub_en, true);
     nh.param<bool>("publish/high_freq_odom_en", high_freq_odom_en, true);
+    nh.param<bool>("publish/high_freq_odom_backward_correct_en", high_freq_odom_backward_correct_en, true);
     nh.param<int>("max_iteration",NUM_MAX_ITERATIONS,4);
     nh.param<string>("map_file_path",map_file_path,"");
     nh.param<string>("common/lid_topic",lid_topic,"/livox/lidar");
@@ -999,6 +1051,12 @@ int main(int argc, char** argv)
 
             t2 = omp_get_wtime();
             
+            /*** save predicted frame-end state for high-freq odom backward correction ***/
+            state_predicted_end_pos = state_point.pos;
+            state_predicted_end_vel = state_point.vel;
+            state_predicted_end_rot = state_point.rot.toRotationMatrix();
+            state_predicted_end_valid = true;
+
             /*** iterated state estimation ***/
             double t_update_start = omp_get_wtime();
             double solve_H_time = 0;
