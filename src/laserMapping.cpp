@@ -45,6 +45,7 @@
 #include <Eigen/Core>
 #include "IMU_Processing.hpp"
 #include <nav_msgs/Odometry.h>
+#include <algorithm>
 #include <nav_msgs/Path.h>
 #include <visualization_msgs/Marker.h>
 #include <pcl_conversions/pcl_conversions.h>
@@ -93,7 +94,10 @@ int    effct_feat_num = 0, time_log_counter = 0, scan_count = 0, publish_count =
 int    iterCount = 0, feats_down_size = 0, NUM_MAX_ITERATIONS = 0, laserCloudValidNum = 0, pcd_save_interval = -1, pcd_index = 0;
 bool   point_selected_surf[100000] = {0};
 bool   lidar_pushed, flg_first_scan = true, flg_exit = false, flg_EKF_inited;
-bool   scan_pub_en = false, dense_pub_en = false, scan_body_pub_en = false, high_freq_odom_en = true, high_freq_odom_backward_correct_en = true;
+bool   scan_pub_en = false, dense_pub_en = false, scan_body_pub_en = false;
+bool   high_freq_odom_en = true, high_freq_odom_backward_correct_en = true;
+bool   high_freq_odom_strict_imu_en = false;           // publish strictly 1 msg per IMU measurement
+bool   high_freq_odom_publish_lidar_end_en = true;     // append a frame-end (lidar_end_time) odom
 int lidar_type;
 
 vector<vector<int>>  pointSearchInd_surf; 
@@ -413,6 +417,18 @@ bool sync_packages(MeasureGroup &meas)
     }
 
     /*** push imu data, and pop from imu buffer ***/
+    // Drop IMU messages that are older than this lidar scan begin time.
+    // (Continuity across scans is handled by ImuProcess::last_imu_ which will be pushed to the front.)
+    while (!imu_buffer.empty() && imu_buffer.front()->header.stamp.toSec() < meas.lidar_beg_time)
+    {
+        imu_buffer.pop_front();
+    }
+
+    if (imu_buffer.empty())
+    {
+        return false;
+    }
+
     double imu_time = imu_buffer.front()->header.stamp.toSec();
     meas.imu.clear();
     while ((!imu_buffer.empty()) && (imu_time < lidar_end_time))
@@ -673,15 +689,26 @@ void publish_odometry_high_freq(const ros::Publisher & pubOdomHighFreq)
         omega = Log(R_err);
     }
 
-    for (size_t i = 0; i < imu_poses.size(); i++)
+    // IMUpose[0] is a synthetic "frame-begin" pose (offset_time=0) built from the current filter state
+    // before propagation; it does NOT correspond to a real IMU message. When strict mode is enabled,
+    // we skip it to keep 1:1 correspondence with IMU messages.
+    const size_t start_idx = high_freq_odom_strict_imu_en ? 1 : 0;
+
+    for (size_t i = start_idx; i < imu_poses.size(); i++)
     {
         const Pose6D & pose = imu_poses[i];
         double t = pcl_beg + pose.offset_time;
+        if (high_freq_odom_strict_imu_en)
+        {
+            // Keep only poses whose timestamps fall inside this lidar scan interval.
+            if (t < pcl_beg || t > lidar_end_time) continue;
+        }
         odom_high.header.stamp = ros::Time().fromSec(t);
 
         if (use_backward_correct)
         {
-            const double alpha = period > 1e-9 ? (pose.offset_time / period) : 0.0;
+            double alpha = period > 1e-9 ? (pose.offset_time / period) : 0.0;
+            alpha = std::clamp(alpha, 0.0, 1.0);
             V3D pos_corrected(pose.pos[0], pose.pos[1], pose.pos[2]);
             V3D vel_corrected(pose.vel[0], pose.vel[1], pose.vel[2]);
             pos_corrected += alpha * delta_pos;
@@ -704,12 +731,15 @@ void publish_odometry_high_freq(const ros::Publisher & pubOdomHighFreq)
         pubOdomHighFreq.publish(odom_high);
     }
 
-    odom_high.header.stamp = ros::Time().fromSec(lidar_end_time);
-    set_posestamp(odom_high.pose);
-    odom_high.twist.twist.linear.x = state_point.vel(0);
-    odom_high.twist.twist.linear.y = state_point.vel(1);
-    odom_high.twist.twist.linear.z = state_point.vel(2);
-    pubOdomHighFreq.publish(odom_high);
+    if (high_freq_odom_publish_lidar_end_en && !high_freq_odom_strict_imu_en)
+    {
+        odom_high.header.stamp = ros::Time().fromSec(lidar_end_time);
+        set_posestamp(odom_high.pose);
+        odom_high.twist.twist.linear.x = state_point.vel(0);
+        odom_high.twist.twist.linear.y = state_point.vel(1);
+        odom_high.twist.twist.linear.z = state_point.vel(2);
+        pubOdomHighFreq.publish(odom_high);
+    }
 }
 
 void publish_path(const ros::Publisher pubPath)
@@ -857,6 +887,8 @@ int main(int argc, char** argv)
     nh.param<bool>("publish/scan_bodyframe_pub_en",scan_body_pub_en, true);
     nh.param<bool>("publish/high_freq_odom_en", high_freq_odom_en, true);
     nh.param<bool>("publish/high_freq_odom_backward_correct_en", high_freq_odom_backward_correct_en, true);
+    nh.param<bool>("publish/high_freq_odom_strict_imu_en", high_freq_odom_strict_imu_en, false);
+    nh.param<bool>("publish/high_freq_odom_publish_lidar_end_en", high_freq_odom_publish_lidar_end_en, true);
     nh.param<int>("max_iteration",NUM_MAX_ITERATIONS,4);
     nh.param<string>("map_file_path",map_file_path,"");
     nh.param<string>("common/lid_topic",lid_topic,"/livox/lidar");
